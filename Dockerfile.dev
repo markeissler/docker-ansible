@@ -1,0 +1,200 @@
+# Dockerfile.dev
+#
+# This Dockerfile is used to spin up a development environment where your local
+# working directory is mounted as a volume within the Docker container.
+#
+FROM ubuntu:16.04
+LABEL maintainer="Mark Eissler <mark@bunker5.com>"
+
+ARG BUILD_PASS='app'
+
+ENV BUILD_HOME='/app'
+ENV BUILD_USER='app'
+ENV BUILD_LOCK="${BUILD_HOME}/.locks"
+ENV BUILD_ROOT="${BUILD_HOME}/source"
+ENV BUILD_STUB="${BUILD_ROOT}"
+
+#
+# Build:
+#   prompt> docker build -t markeissler/ansible-dev:latest -f Dockerfile.dev .
+#
+# Run locally:
+#   prompt> docker run -it --rm -e TERM=$TERM -e COLUMNS=$COLUMNS -e ROWS=$ROWS -v $PWD:/app/source markeissler/ansible-dev /bin/bash
+#
+# Connect to terminal after startup:
+#   prompt> docker exec -it -e TERM=$TERM -e COLUMNS=$COLUMNS -e ROWS=$ROWS ansible-dev /bin/bash
+#
+# NOTE: You may need or want to pass the --no-cache option to build a completely fresh image.
+#
+
+ARG BUILD_TEMP='/build'
+
+# Make temporary build dir
+RUN set -x \
+    && mkdir -p /build/config/etc
+
+# Install dependencies including a complete build environment
+RUN set -x \
+    && apt-get update --quiet \
+    && DEBIAN_FRONTEND=noninteractive \
+        apt-get install --quiet --yes --no-install-recommends \
+        apt-transport-https \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        iproute2 \
+        locales \
+        netcat \
+        openssh-client \
+        openssh-server \
+        unzip \
+    && apt-get clean
+
+# Install some utilities we might use from the command line
+RUN set -x \
+    && apt-get update --quiet \
+    && apt-get install --quiet --yes --no-install-recommends \
+        dnsutils \
+        less \
+        sudo \
+        telnet \
+        vim \
+    && apt-get clean
+
+# Install rsyslog
+RUN set -x \
+    && apt-get install --quiet --yes --no-install-recommends \
+        rsyslog \
+    && apt-get clean
+
+# Copy rsyslog config files
+COPY ./config/etc ./build/config/etc
+
+# Update rsyslog.conf
+RUN set -x \
+    && cp "/build/config/etc/rsyslog.conf" "/etc/rsyslog.conf" \
+    && chmod 0644 "/etc/rsyslog.conf" \
+    && chown -R root:root "/etc/rsyslog.conf"
+
+# Install python pip (required for supervisor installation)
+RUN set -x \
+    && apt-get update --quiet \
+    && apt-get install --quiet --yes --no-install-recommends \
+        python \
+    && apt-get clean \
+    && curl -sSL https://bootstrap.pypa.io/get-pip.py | python
+
+# Install supervisor and stdout event listener
+RUN set -x \
+    && pip install --upgrade pip \
+    && pip install supervisor --pre \
+    && pip install supervisor-stdout
+
+# Copy supervisor config files
+COPY ./config/supervisor/ ./build/config/supervisor/
+
+# Update supervisor config
+RUN set -x \
+    && mkdir -p "/usr/local/etc/supervisor" \
+    && cp "/build/config/supervisor/supervisord.conf" "/usr/local/etc/supervisor" \
+    && chown -R root:root "/usr/local/etc/supervisor/supervisord.conf" \
+    && chmod 0600 "/usr/local/etc/supervisor/supervisord.conf" \
+    && mkdir -p "/usr/local/etc/supervisor/conf.d" \
+    && cp "/build/config/supervisor/conf.d/"*.ini "/usr/local/etc/supervisor/conf.d" \
+    && chown -R root:root "/usr/local/etc/supervisor" \
+    && find "/usr/local/etc/supervisor" -type d -exec chmod 0700 {} \; \
+    && find "/usr/local/etc/supervisor" -type f -name '*.ini' -exec chmod 0600 {} \;
+
+# Install sshd config
+RUN set -x \
+    && mkdir -p "/var/run/sshd" \
+    && chown -R root:root "/var/run/sshd" \
+    && chmod 0700 "/var/run/sshd"
+
+# Copy system-init files
+COPY ./config/system-init ./build/config/system-init
+
+# Install system-init scripts
+RUN set -x \
+    && mkdir -p "/usr/local/etc/system-init" \
+    && cp "/build/config/system-init/"*.sh "/usr/local/etc/system-init" \
+    && chown -R root:root "/usr/local/etc/system-init" \
+    && find "/usr/local/etc/system-init" -type f -name '*.sh' -exec chmod 0700 {} \;
+
+# Install database dependencies
+RUN set -x \
+    && curl -sSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - \
+    && echo "deb http://apt.postgresql.org/pub/repos/apt/ xenial-pgdg main" > "/etc/apt/sources.list.d/xenial-pgdg.list" \
+    && apt-get update --quiet \
+    && apt-get install --quiet --yes --no-install-recommends \
+        postgresql-client-10 \
+    && apt-get clean
+
+# Install ansible
+RUN set -x \
+    && gpg --keyserver keyserver.ubuntu.com --recv 93C4A3FD7BB9C367 && gpg --export --armor 93C4A3FD7BB9C367 | apt-key add - \
+    && echo "deb http://ppa.launchpad.net/ansible/ansible/ubuntu/ xenial main" > "/etc/apt/sources.list.d/xenial-ansible.list" \
+    && apt-get update --quiet \
+    && apt-get install --quiet --yes --no-install-recommends \
+        ansible \
+        python-apt \
+    && apt-get clean
+
+# Add build user, reconfigure sudo so users in sudo group don't need a password
+RUN set -x \
+    && useradd --create-home --home-dir "${BUILD_HOME}" \
+        --groups sudo --password "$(openssl passwd -1 ${BUILD_PASS})" \
+        --shell /bin/bash "${BUILD_USER}" \
+    && sed --in-place "s/^%sudo/#sudo/" "/etc/sudoers" \
+    && printf         "\n%%sudo ALL=(ALL) NOPASSWD:ALL\n\n" >> "/etc/sudoers" \
+    && printf         "\nexport TERM=xterm" >> "${BUILD_HOME}/.bash_profile"
+
+# Copy bootstrap files into container
+COPY ./docker-*.sh ./build/
+
+# Update docker-entrypoint.sh
+RUN set -x \
+    && cp "/build/docker-entrypoint.sh" "/docker-entrypoint.sh" \
+    && chmod 755 "/docker-entrypoint.sh" \
+    && chown "${BUILD_USER}":"${BUILD_USER}" "/docker-entrypoint.sh"
+
+# Copy user files into container
+COPY ./bin ./build/bin
+
+# Configure the main working directory. This is the base directory used in any
+# further RUN, COPY, and ENTRYPOINT commands.
+RUN mkdir -p "${BUILD_HOME}" "${BUILD_HOME}/bin" "${BUILD_LOCK}" "${BUILD_ROOT}" "${BUILD_STUB}"
+WORKDIR "${BUILD_HOME}"
+
+# Install user utilities
+RUN set -x \
+    && find "${BUILD_HOME}/bin" -type f -name '*.sh' -exec cp {} "${BUILD_HOME}/bin" \; \
+    && find "${BUILD_HOME}/bin" -type d -exec chmod 0700 {} \; \
+    && find "${BUILD_HOME}/bin" -type f -name '*.sh' -exec chmod 0700 {} \;
+
+# Copy additional files into container
+
+# Fix permissions on directories
+RUN set -x \
+    && chown -R "${BUILD_USER}":"${BUILD_USER}" "${BUILD_HOME}" "${BUILD_LOCK}" "${BUILD_ROOT}" "${BUILD_STUB}"
+
+# Remove build directory
+RUN set -x \
+    && rm -rf "${BUILD_TEMP}"
+
+# ssh port
+EXPOSE 2022
+
+# generic web port
+EXPOSE 8080
+
+# supervisor port
+EXPOSE 4001
+
+USER "${BUILD_USER}"
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
+
+# default command (startup supervisor)
+CMD ["sudo", "-E", "/usr/local/etc/system-init/init.sh"]
